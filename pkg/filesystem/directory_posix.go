@@ -3,17 +3,14 @@
 package filesystem
 
 import (
-	cryptorand "crypto/rand"
-	"encoding/binary"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"runtime"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -91,24 +88,6 @@ func (d *Directory) CreateDirectory(name string) error {
 	return mkdiratRetryingOnEINTR(d.descriptor, name, 0700)
 }
 
-// createTemporaryFilePRNGLock serializes access to createTemporaryFilePRNG.
-var createTemporaryFilePRNGLock sync.Mutex
-
-// createTemporaryFilePRNG provides pseudorandom numbers for filenames in
-// Directory.CreateTemporaryFile.
-var createTemporaryFilePRNG *rand.Rand
-
-func init() {
-	// Read random data to compute a seed for the pseudorandom number generator.
-	var seedBytes [8]byte
-	if _, err := cryptorand.Read(seedBytes[:]); err != nil {
-		panic("unable to read random bytes for seed")
-	}
-
-	// Initialize the pseudorandom number generator.
-	createTemporaryFilePRNG = rand.New(rand.NewSource(int64(binary.BigEndian.Uint64(seedBytes[:]))))
-}
-
 // CreateTemporaryFile creates a new temporary file using the specified name
 // pattern inside the directory. Pattern behavior follows that of os.CreateTemp.
 // The file will be created with user-only read/write permissions.
@@ -130,11 +109,13 @@ func (d *Directory) CreateTemporaryFile(pattern string) (string, io.WriteCloser,
 	// Iterate until we can find a free file name.
 	try := 0
 	for {
-		// Compute the next potential name using a pseudorandom component.
-		createTemporaryFilePRNGLock.Lock()
-		random := createTemporaryFilePRNG.Int()
-		createTemporaryFilePRNGLock.Unlock()
-		name := prefix + strconv.Itoa(random) + suffix
+		// Compute the next potential name using cryptographically random bytes.
+		// This is safe to call concurrently without a lock.
+		var randomBytes [8]byte
+		if _, err := rand.Read(randomBytes[:]); err != nil {
+			return "", nil, fmt.Errorf("unable to generate random filename component: %w", err)
+		}
+		name := prefix + hex.EncodeToString(randomBytes[:]) + suffix
 
 		// Open the file. Note that we needn't specify O_NOFOLLOW here since
 		// we're enforcing that the file doesn't already exist.
@@ -427,6 +408,12 @@ func (d *Directory) OpenFile(name string) (io.ReadSeekCloser, *Metadata, error) 
 // implementation.
 const readlinkInitialBufferSize = 128
 
+// readlinkMaximumBufferSize is the upper bound on the buffer used for
+// readlinkat. Symlink targets this long would be rejected anyway during
+// synchronization (see symbolic_link.go), so exceeding this limit indicates
+// a filesystem anomaly rather than a legitimate path.
+const readlinkMaximumBufferSize = 65536
+
 // ReadSymbolicLink reads the target of the symbolic link within the directory
 // specified by name.
 func (d *Directory) ReadSymbolicLink(name string) (string, error) {
@@ -439,7 +426,7 @@ func (d *Directory) ReadSymbolicLink(name string) (string, error) {
 	// symbolic link and with buffer space to spare. This is the only way to
 	// approach the problem because readlink and its ilk don't provide any
 	// mechanism for determining the untruncated length of the symbolic link.
-	for size := readlinkInitialBufferSize; ; size *= 2 {
+	for size := readlinkInitialBufferSize; size <= readlinkMaximumBufferSize; size *= 2 {
 		// Allocate a buffer.
 		buffer := make([]byte, size)
 
@@ -468,6 +455,7 @@ func (d *Directory) ReadSymbolicLink(name string) (string, error) {
 			return string(buffer[:count]), nil
 		}
 	}
+	return "", errors.New("symbolic link target exceeds maximum allowed length")
 }
 
 // RemoveDirectory deletes a directory with the specified name inside the
