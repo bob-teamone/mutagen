@@ -4,9 +4,8 @@ package ipc
 
 import (
 	"context"
-	"fmt"
 	"net"
-	"os"
+	"syscall"
 )
 
 // DialContext attempts to establish an IPC connection, timing out if the
@@ -22,17 +21,17 @@ func DialContext(ctx context.Context, path string) (net.Conn, error) {
 
 // NewListener creates a new IPC listener.
 func NewListener(path string) (net.Listener, error) {
-	// Create the listener.
+	// Narrow the umask to 0177 before creating the socket so that the kernel
+	// creates it with mode 0600 (owner-only read/write) from the outset.
+	// This eliminates the TOCTOU window that would otherwise exist between
+	// net.Listen and an os.Chmod call. syscall.Umask is process-wide, not
+	// goroutine-local, but the critical section is a single syscall, so the
+	// window during which the umask is narrowed is effectively instantaneous.
+	oldUmask := syscall.Umask(0177)
 	listener, err := net.Listen("unix", path)
+	syscall.Umask(oldUmask)
 	if err != nil {
 		return nil, err
-	}
-
-	// Explicitly set socket permissions. Unfortunately we can't do this
-	// atomically on socket creation, but we can do it quickly.
-	if err := os.Chmod(path, 0600); err != nil {
-		listener.Close()
-		return nil, fmt.Errorf("unable to set socket permissions: %w", err)
 	}
 
 	// Success.
